@@ -1,5 +1,5 @@
 "use strict";
-const { Plugin, Notice, PluginSettingTab, Setting } = require("obsidian");
+const { Plugin, Notice, PluginSettingTab, Setting, MarkdownRenderer } = require("obsidian");
 const DEFAULTS = { margin: 80 };
 
 module.exports = class CanvasLiveSnapshot extends Plugin {
@@ -97,6 +97,31 @@ class SnapshotSettings extends PluginSettingTab {
 async function createSnapshot(plugin, wrapper) {
   const document = wrapper.ownerDocument;
   const getComputedStyle = document.defaultView.getComputedStyle.bind(document.defaultView);
+  // ============================================================
+  // 0. 读 .canvas JSON，建 id→text 映射
+  //
+  // 节点文本在低 zoom 或小尺寸下会被 Canvas / Advanced Canvas 折叠，
+  // cloneNode 出来的 DOM 也是残缺的。从源 JSON 读出原始 markdown，
+  // 再用 MarkdownRenderer 重渲染到 clone 内部，保证文本完整。
+  // ============================================================
+  const canvasView = plugin.app.workspace.activeLeaf?.view;
+  const nodeTextMap = new Map();
+  if (canvasView && canvasView.file) {
+    try {
+      const raw = await plugin.app.vault.read(canvasView.file);
+      const parsed = JSON.parse(raw);
+      for (const n of (parsed.nodes || [])) {
+        if (n && n.id != null) {
+          nodeTextMap.set(n.id, {
+            text: typeof n.text === "string" ? n.text : "",
+            type: n.type || "text",
+          });
+        }
+      }
+    } catch (err) {
+      console.warn("Canvas Live Snapshot: 解析 .canvas JSON 失败", err);
+    }
+  }
   const edgeSvg =
     wrapper.querySelector(
       'svg.canvas-edges'
@@ -1229,6 +1254,37 @@ async function createSnapshot(plugin, wrapper) {
       original,
       clone
     );
+    // ----------------------------------------------------------
+    // 从 .canvas JSON 还原节点文本
+    //
+    // 低 zoom 或节点过小时，Canvas / Advanced Canvas 会折叠节点内部内容，
+    // cloneNode 拿到的也是残缺版。这里用 data-id 从源 JSON 拿到原始
+    // markdown，再用 MarkdownRenderer 重渲染，保证 PDF 里能看到完整内容。
+    // ----------------------------------------------------------
+    if (!group) {
+      const dataId = original.dataset?.id || original.getAttribute("data-id");
+      const entry = dataId ? nodeTextMap.get(dataId) : null;
+      if (entry && entry.text) {
+        const container =
+          clone.querySelector(".canvas-node-content .markdown-source") ||
+          clone.querySelector(".canvas-node-content") ||
+          clone.querySelector(".markdown-source") ||
+          clone.querySelector('[class*="markdown-source"]') ||
+          clone;
+        try {
+          while (container.firstChild) container.removeChild(container.firstChild);
+          await MarkdownRenderer.render(
+            plugin.app,
+            entry.text,
+            container,
+            canvasView && canvasView.file ? canvasView.file.path : "",
+            plugin
+          );
+        } catch (err) {
+          console.warn("Canvas Live Snapshot: 节点文本重渲染失败", dataId, err);
+        }
+      }
+    }
     // ----------------------------------------------------------
     removeUI(clone);
     // 去掉 Canvas 世界坐标
