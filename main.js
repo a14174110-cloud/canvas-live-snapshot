@@ -98,30 +98,27 @@ async function createSnapshot(plugin, wrapper) {
   const document = wrapper.ownerDocument;
   const getComputedStyle = document.defaultView.getComputedStyle.bind(document.defaultView);
   // ============================================================
-  // 0. 读 .canvas JSON，建 id→text 映射
+  // 0. 读 .canvas JSON，建 原始DOM元素 → JSON节点 映射
   //
-  // 节点文本在低 zoom 或小尺寸下会被 Canvas / Advanced Canvas 折叠，
-  // cloneNode 出来的 DOM 也是残缺的。从源 JSON 读出原始 markdown，
-  // 再用 MarkdownRenderer 重渲染到 clone 内部，保证文本完整。
+  // Advanced Canvas 渲染的 DOM 没有 data-id 属性，无法用 id 关联。
+  // 但 .canvas JSON 的 nodes[] 数组顺序和 DOM 中 .canvas-node 出现
+  // 顺序一致（Obsidian Canvas 也是这样），所以按 DOM 顺序索引即可。
   // ============================================================
   const canvasView = plugin.app.workspace.activeLeaf?.view;
-  const nodeTextMap = new Map();
+  const canvasNodes = [];
   if (canvasView && canvasView.file) {
     try {
       const raw = await plugin.app.vault.read(canvasView.file);
       const parsed = JSON.parse(raw);
       for (const n of (parsed.nodes || [])) {
-        if (n && n.id != null) {
-          nodeTextMap.set(n.id, {
-            text: typeof n.text === "string" ? n.text : "",
-            type: n.type || "text",
-          });
-        }
+        canvasNodes.push(n);
       }
     } catch (err) {
       console.warn("Canvas Live Snapshot: 解析 .canvas JSON 失败", err);
     }
   }
+  // domNodeToJsonNode 在 step 2 收集到 items 之后再建立，这里先留空。
+  const domNodeToJsonNode = new Map();
   const edgeSvg =
     wrapper.querySelector(
       'svg.canvas-edges'
@@ -213,6 +210,24 @@ async function createSnapshot(plugin, wrapper) {
         'hidden'
     );
   });
+  // ------------------------------------------------------------
+  // 建立 DOM 元素 → JSON 节点 的映射
+  //
+  // 优先级：
+  //   1) DOM 元素自身有 data-id 且 JSON 里有匹配（原生 Canvas）
+  //   2) 否则按 DOM 出现顺序匹配 JSON.nodes[]（Advanced Canvas）
+  // ------------------------------------------------------------
+  for (let i = 0; i < items.length && i < canvasNodes.length; i++) {
+    domNodeToJsonNode.set(items[i], canvasNodes[i]);
+  }
+  // 兼容 1：data-id 优先级更高
+  for (const el of items) {
+    const did = el.dataset?.id || el.getAttribute('data-id');
+    if (!did) continue;
+    const match = canvasNodes.find(n => n && n.id === did);
+    if (match) domNodeToJsonNode.set(el, match);
+  }
+  console.log(`Canvas Live Snapshot: ${domNodeToJsonNode.size} / ${items.length} 节点已建立 JSON 映射`);
   if (!items.length) {
     new Notice(
       '没有找到 Canvas 节点。'
@@ -1258,13 +1273,13 @@ async function createSnapshot(plugin, wrapper) {
     // 从 .canvas JSON 还原节点文本
     //
     // 低 zoom 或节点过小时，Canvas / Advanced Canvas 会折叠节点内部内容，
-    // cloneNode 拿到的也是残缺版。这里用 data-id 从源 JSON 拿到原始
+    // cloneNode 拿到的也是残缺版。这里用 domNodeToJsonNode 拿到原始
     // markdown，再用 MarkdownRenderer 重渲染，保证 PDF 里能看到完整内容。
     // ----------------------------------------------------------
     if (!group) {
-      const dataId = original.dataset?.id || original.getAttribute("data-id");
-      const entry = dataId ? nodeTextMap.get(dataId) : null;
-      if (entry && entry.text) {
+      const jsonNode = domNodeToJsonNode.get(original);
+      const fullText = jsonNode && typeof jsonNode.text === "string" ? jsonNode.text : "";
+      if (fullText) {
         const container =
           clone.querySelector(".canvas-node-content .markdown-source") ||
           clone.querySelector(".canvas-node-content") ||
@@ -1275,13 +1290,13 @@ async function createSnapshot(plugin, wrapper) {
           while (container.firstChild) container.removeChild(container.firstChild);
           await MarkdownRenderer.render(
             plugin.app,
-            entry.text,
+            fullText,
             container,
             canvasView && canvasView.file ? canvasView.file.path : "",
             plugin
           );
         } catch (err) {
-          console.warn("Canvas Live Snapshot: 节点文本重渲染失败", dataId, err);
+          console.warn("Canvas Live Snapshot: 节点文本重渲染失败", err);
         }
       }
     }
